@@ -1,4 +1,15 @@
 # Changelog
+## [0.2.1] - 2026-10-19
+### Breaking changes
+ - N/A
+
+### New features
+ - N/A
+
+### Bug fixes
+ - example: add SPDX license line. (53ff2d6)
+ - Enable github CI. (de3871c)
+
 ## [0.2.0] - 2026-10-19
 ### Breaking changes
  - API break: redesign the apply action. (17b8915)
