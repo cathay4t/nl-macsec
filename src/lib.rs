@@ -12,8 +12,7 @@
 //! [MacsecHandle::get_all] returns the parsed [MacsecConfig] of every SecY.
 //! Filter the returned vector by [MacsecConfig::ifindex] when needed.
 //!
-//! A complete desired state is applied with a single [MacsecHandle::apply]
-//! call:
+//! A desired state is applied with a single [MacsecHandle::apply] call:
 //!
 //! ```no_run
 //! use nl_macsec::{MacsecConfig, MacsecSaConfig};
@@ -31,14 +30,16 @@
 //!     sa.key = Some(vec![0x81; 16]);
 //!     sa.key_id = vec![0x01];
 //!     sa.active = Some(true);
-//!     config.tx_sa.push(sa);
+//!     config.tx_sa = Some(vec![sa]);
 //!     handle.apply(&config).await?;
 //!     Ok(())
 //! }
 //! ```
 //!
-//! Set [MacsecConfig::delete] to `true` before calling [MacsecHandle::apply]
-//! to delete all TX SAs and RX SCs of the SecY.
+//! The list fields [MacsecConfig::tx_sa], [MacsecConfig::rx_sc] and
+//! [MacsecRxScConfig::sa_list] are left untouched when they are `None` and
+//! describe the complete desired set when they are `Some`.
+//! `Some(Vec::new())` removes all entries of that list.
 
 mod config;
 mod connection;

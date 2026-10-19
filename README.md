@@ -31,14 +31,15 @@ async fn configure() -> Result<(), Box<dyn std::error::Error>> {
     sa.key = Some(vec![0x81; 16]);
     sa.key_id = vec![0x01];
     sa.active = Some(true);
-    config.tx_sa.push(sa);
+    config.tx_sa = Some(vec![sa]);
     handle.apply(&config).await?;
     Ok(())
 }
 ```
 
-Set `MacsecConfig::delete` to `true` before calling `apply` to delete all
-TX SAs and RX SCs of the SecY:
+List fields are left untouched when they are `None` and are complete
+desired sets when they are `Some`. Set `tx_sa` or `rx_sc` to
+`Some(Vec::new())` to remove all of them:
 
 ```rust,no_run
 use nl_macsec::MacsecConfig;
@@ -48,10 +49,26 @@ async fn delete() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(conn);
 
     let mut config = MacsecConfig::new(3);
-    config.delete = true;
+    config.tx_sa = Some(Vec::new());
+    config.rx_sc = Some(Vec::new());
     handle.apply(&config).await?;
     Ok(())
 }
+```
+
+An RX SC is kept when it is still listed; set its `sa_list` to
+`Some(Vec::new())` to delete all its SAs without deleting the SC.
+
+## Examples
+
+Runnable examples are in the `examples` directory (default `tokio_socket`
+feature, run as root):
+
+```console
+cargo run --example show
+cargo run --example configure -- <ifindex> <rx-sci-hex>
+cargo run --example multi_sa -- <ifindex> <rx-sci-hex> [off|phy|mac]
+cargo run --example purge -- <ifindex>
 ```
 
 License: MIT

@@ -24,6 +24,9 @@ impl MacsecHandle {
     }
 
     /// Dump all MACsec SecYs of the current network namespace.
+    ///
+    /// The list fields of each returned [MacsecConfig] are `Some`, including
+    /// empty lists when the SecY has no TX SAs or RX SCs.
     pub async fn get_all(&mut self) -> Result<Vec<MacsecConfig>, MacsecError> {
         let message = MacsecMessage::new(MacsecCmd::GetTxsc);
         let mut stream =
@@ -36,20 +39,24 @@ impl MacsecHandle {
         Ok(secys)
     }
 
-    /// Apply a complete MACsec configuration.
+    /// Apply a desired MACsec configuration.
+    ///
+    /// The current SecY state is read first and the minimum set of add,
+    /// update and delete requests is sent to make it match `config`.
     ///
     /// MACsec netdevice properties except the offload mode (`sci`, cipher
     /// suite, ICV length, encryption, ...) are configured through rtnetlink
     /// when the netdevice is created and are read-only here.
     ///
-    /// When [MacsecConfig::delete] is false, every TX SA and RX SC/SA in
-    /// `config` is added or updated. Entries which exist in the kernel but
-    /// are not in `config` are left untouched. Creating a new SA requires
-    /// its key; the kernel never reports keys, so a configuration returned
-    /// by [MacsecHandle::get_all] can only update existing SAs.
+    /// List fields ([MacsecConfig::tx_sa], [MacsecConfig::rx_sc] and
+    /// [crate::MacsecRxScConfig::sa_list]) are complete desired sets when
+    /// they are `Some`: entries present in the kernel but missing from the
+    /// list are deleted, and `Some(Vec::new())` deletes all entries. `None`
+    /// leaves the current entries untouched.
     ///
-    /// When [MacsecConfig::delete] is true, all TX SAs and RX SCs of the
-    /// SecY are deleted. Active TX SAs are deactivated first.
+    /// Creating a new SA requires its key; the kernel never reports keys,
+    /// so a configuration returned by [MacsecHandle::get_all] can only
+    /// update existing SAs.
     ///
     /// Applying a configuration for an ifindex which does not exist, or
     /// which is not a MACsec SecY, does nothing and succeeds.

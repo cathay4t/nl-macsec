@@ -389,26 +389,38 @@ fn invalid_input(msg: &str) -> MacsecError {
 }
 
 /// A complete MACsec SecY configuration, as returned by
-/// [crate::MacsecHandle::get] and [crate::MacsecHandle::get_all].
+/// [crate::MacsecHandle::get_all].
 ///
 /// The SecY fields except [MacsecSecyConfig::offload] are configured through
 /// rtnetlink when the MACsec netdevice is created and cannot be changed by
 /// the `macsec` generic netlink family. [crate::MacsecHandle::apply] manages
 /// the secure associations, receive secure channels and offload mode.
+///
+/// For [crate::MacsecHandle::apply], the list fields [MacsecConfig::tx_sa],
+/// [MacsecConfig::rx_sc] and [MacsecRxScConfig::sa_list] are complete desired
+/// sets when they are `Some`, and are left untouched when they are `None`.
+/// `Some(Vec::new())` therefore removes all entries of that list.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct MacsecConfig {
     /// The ifindex of the MACsec netdevice.
     pub ifindex: u32,
-    /// Delete all TX SAs and RX SCs of the SecY when passed to
-    /// [crate::MacsecHandle::apply].
-    pub delete: bool,
     /// The SecY properties.
     pub secy: MacsecSecyConfig,
-    /// The transmit secure associations.
-    pub tx_sa: Vec<MacsecSaConfig>,
+    /// The TX SAs of the transmit secure channel.
+    ///
+    /// `None` leaves the current TX SAs untouched. `Some(list)` describes
+    /// the complete desired set: TX SAs missing from `list` are deleted,
+    /// listed SAs are added or updated, and `Some(Vec::new())` deletes all
+    /// TX SAs.
+    pub tx_sa: Option<Vec<MacsecSaConfig>>,
     /// The receive secure channels and their associations.
-    pub rx_sc: Vec<MacsecRxScConfig>,
+    ///
+    /// `None` leaves the current RX SCs untouched. `Some(list)` describes
+    /// the complete desired set: RX SCs missing from `list` are deleted,
+    /// listed SCs are added or updated, and `Some(Vec::new())` deletes all
+    /// RX SCs.
+    pub rx_sc: Option<Vec<MacsecRxScConfig>>,
     /// SecY statistics.
     pub secy_stats: MacsecSecyStats,
     /// Transmit secure channel statistics.
@@ -416,8 +428,10 @@ pub struct MacsecConfig {
 }
 
 impl MacsecConfig {
-    /// Create an empty configuration for the MACsec netdevice with
-    /// `ifindex`.
+    /// Create a configuration for the MACsec netdevice with `ifindex`.
+    ///
+    /// List fields and other optional properties are `None`, so applying this
+    /// configuration leaves the current state unchanged.
     pub fn new(ifindex: u32) -> Self {
         Self {
             ifindex,
@@ -534,7 +548,12 @@ pub struct MacsecRxScConfig {
     /// Whether the secure channel is active.
     pub active: Option<bool>,
     /// The receive secure associations.
-    pub sa_list: Vec<MacsecSaConfig>,
+    ///
+    /// `None` leaves the current SAs untouched. `Some(list)` describes the
+    /// complete desired set: SAs missing from `list` are deleted, listed
+    /// SAs are added or updated, and `Some(Vec::new())` deletes all SAs
+    /// while keeping the secure channel.
+    pub sa_list: Option<Vec<MacsecSaConfig>>,
     /// Per-RX-SC statistics.
     pub stats: MacsecRxScStats,
 }
@@ -607,9 +626,17 @@ impl MacsecConfig {
     /// generic-netlink messages which make the kernel state match `self`.
     ///
     /// A complete SecY configuration requires multiple messages: the kernel
-    /// has no bulk-replace command. When [MacsecConfig::delete] is true, the
-    /// messages delete all TX SAs and RX SCs of `current`; otherwise the
-    /// messages add or update the TX SAs and RX SCs/SAs listed in `self`.
+    /// has no bulk-replace command.
+    ///
+    /// TX SAs, RX SCs and RX SAs are only touched when their `Option` is
+    /// `Some`: `None` leaves the current state untouched, while a `Some`
+    /// list is the complete desired set and therefore deletes entries which
+    /// are not listed. `Some(Vec::new())` deletes all entries of that list.
+    ///
+    /// Existing SAs are matched by AN (within the SC for RX SAs). Since the
+    /// kernel never reports SA keys or salts, a key or salt in a listed SA
+    /// is only used when the SA has to be created. Changing the key of an
+    /// existing SA requires deleting and re-adding the SA.
     pub fn to_messages(
         &self,
         current: &Self,
@@ -624,28 +651,6 @@ impl MacsecConfig {
 
         let mut messages = Vec::new();
 
-        if desired.delete {
-            for sa in &current.tx_sa {
-                if sa.active == Some(true) {
-                    let mut deactivate =
-                        MacsecTxSa::new(desired.ifindex, sa.an);
-                    deactivate.active = Some(false);
-                    messages.push(deactivate.build(MacsecCmd::UpdTxsa)?);
-                }
-                messages.push(
-                    MacsecTxSa::new(desired.ifindex, sa.an)
-                        .build(MacsecCmd::DelTxsa)?,
-                );
-            }
-            for sc in &current.rx_sc {
-                messages.push(
-                    MacsecRxSc::new(desired.ifindex, sc.sci)
-                        .build(MacsecCmd::DelRxsc)?,
-                );
-            }
-            return Ok(messages);
-        }
-
         if let Some(offload) = desired.secy.offload
             && current.secy.offload != Some(offload)
         {
@@ -653,101 +658,189 @@ impl MacsecConfig {
         }
 
         let xpn = desired.is_xpn();
+        let current_tx_sa = current.tx_sa.as_deref().unwrap_or(&[]);
+        let current_rx_sc = current.rx_sc.as_deref().unwrap_or(&[]);
 
-        for wanted in &desired.tx_sa {
-            match current.tx_sa.iter().find(|sa| sa.an == wanted.an) {
-                None => messages.push(
-                    tx_sa_from_config(desired.ifindex, wanted, xpn)
-                        .build(MacsecCmd::AddTxsa)?,
-                ),
-                Some(current_sa) => {
-                    let mut update =
-                        MacsecTxSa::new(desired.ifindex, wanted.an);
-                    update.xpn = xpn;
-                    let mut changed = false;
-                    if wanted.pn.is_some() && wanted.pn != current_sa.pn {
-                        update.pn = wanted.pn;
-                        changed = true;
-                    }
-                    if wanted.active.is_some()
-                        && wanted.active != current_sa.active
-                    {
-                        update.active = wanted.active;
-                        changed = true;
-                    }
-                    if changed {
-                        messages.push(update.build(MacsecCmd::UpdTxsa)?);
-                    }
-                }
-            }
+        if let Some(tx_sa) = &desired.tx_sa {
+            messages.extend(tx_sa_messages(
+                desired.ifindex,
+                tx_sa,
+                current_tx_sa,
+                xpn,
+            )?);
         }
 
-        for wanted_sc in &desired.rx_sc {
-            let current_sc =
-                current.rx_sc.iter().find(|sc| sc.sci == wanted_sc.sci);
-            match current_sc {
-                None => {
-                    let mut new_sc =
-                        MacsecRxSc::new(desired.ifindex, wanted_sc.sci);
-                    new_sc.active = wanted_sc.active;
-                    messages.push(new_sc.build(MacsecCmd::AddRxsc)?);
-                }
-                Some(current_sc) => {
-                    if wanted_sc.active.is_some()
-                        && wanted_sc.active != current_sc.active
-                    {
-                        let mut update =
-                            MacsecRxSc::new(desired.ifindex, wanted_sc.sci);
-                        update.active = wanted_sc.active;
-                        messages.push(update.build(MacsecCmd::UpdRxsc)?);
-                    }
-                }
-            }
-
-            for wanted_sa in &wanted_sc.sa_list {
-                let current_sa = current_sc.and_then(|sc| {
-                    sc.sa_list.iter().find(|sa| sa.an == wanted_sa.an)
-                });
-                match current_sa {
-                    None => messages.push(
-                        rx_sa_from_config(
-                            desired.ifindex,
-                            wanted_sc.sci,
-                            wanted_sa,
-                            xpn,
-                        )
-                        .build(MacsecCmd::AddRxsa)?,
-                    ),
-                    Some(current_sa) => {
-                        let mut update = MacsecRxSa::new(
-                            desired.ifindex,
-                            wanted_sc.sci,
-                            wanted_sa.an,
-                        );
-                        update.xpn = xpn;
-                        let mut changed = false;
-                        if wanted_sa.pn.is_some()
-                            && wanted_sa.pn != current_sa.pn
-                        {
-                            update.pn = wanted_sa.pn;
-                            changed = true;
-                        }
-                        if wanted_sa.active.is_some()
-                            && wanted_sa.active != current_sa.active
-                        {
-                            update.active = wanted_sa.active;
-                            changed = true;
-                        }
-                        if changed {
-                            messages.push(update.build(MacsecCmd::UpdRxsa)?);
-                        }
-                    }
-                }
-            }
+        if let Some(rx_sc) = &desired.rx_sc {
+            messages.extend(rx_sc_messages(
+                desired.ifindex,
+                rx_sc,
+                current_rx_sc,
+                xpn,
+            )?);
         }
 
         Ok(messages)
     }
+}
+
+fn tx_sa_messages(
+    ifindex: u32,
+    desired: &[MacsecSaConfig],
+    current: &[MacsecSaConfig],
+    xpn: bool,
+) -> Result<Vec<MacsecMessage>, MacsecError> {
+    let mut messages = Vec::new();
+
+    for current_sa in current {
+        if desired.iter().any(|sa| sa.an == current_sa.an) {
+            continue;
+        }
+        if current_sa.active == Some(true) {
+            let mut deactivate = MacsecTxSa::new(ifindex, current_sa.an);
+            deactivate.active = Some(false);
+            messages.push(deactivate.build(MacsecCmd::UpdTxsa)?);
+        }
+        messages.push(
+            MacsecTxSa::new(ifindex, current_sa.an)
+                .build(MacsecCmd::DelTxsa)?,
+        );
+    }
+
+    for wanted in desired {
+        match current.iter().find(|sa| sa.an == wanted.an) {
+            None => messages.push(
+                tx_sa_from_config(ifindex, wanted, xpn)
+                    .build(MacsecCmd::AddTxsa)?,
+            ),
+            Some(current_sa) => {
+                let mut update = MacsecTxSa::new(ifindex, wanted.an);
+                update.xpn = xpn;
+                let mut changed = false;
+                if wanted.pn.is_some() && wanted.pn != current_sa.pn {
+                    update.pn = wanted.pn;
+                    changed = true;
+                }
+                if wanted.active.is_some() && wanted.active != current_sa.active
+                {
+                    update.active = wanted.active;
+                    changed = true;
+                }
+                if changed {
+                    messages.push(update.build(MacsecCmd::UpdTxsa)?);
+                }
+            }
+        }
+    }
+
+    Ok(messages)
+}
+
+fn rx_sc_messages(
+    ifindex: u32,
+    desired: &[MacsecRxScConfig],
+    current: &[MacsecRxScConfig],
+    xpn: bool,
+) -> Result<Vec<MacsecMessage>, MacsecError> {
+    let mut messages = Vec::new();
+
+    for current_sc in current {
+        if desired.iter().any(|sc| sc.sci == current_sc.sci) {
+            continue;
+        }
+        messages.push(
+            MacsecRxSc::new(ifindex, current_sc.sci)
+                .build(MacsecCmd::DelRxsc)?,
+        );
+    }
+
+    for wanted_sc in desired {
+        let current_sc = current.iter().find(|sc| sc.sci == wanted_sc.sci);
+
+        match current_sc {
+            None => {
+                let mut new_sc = MacsecRxSc::new(ifindex, wanted_sc.sci);
+                new_sc.active = wanted_sc.active;
+                messages.push(new_sc.build(MacsecCmd::AddRxsc)?);
+            }
+            Some(current_sc) => {
+                if wanted_sc.active.is_some()
+                    && wanted_sc.active != current_sc.active
+                {
+                    let mut update = MacsecRxSc::new(ifindex, wanted_sc.sci);
+                    update.active = wanted_sc.active;
+                    messages.push(update.build(MacsecCmd::UpdRxsc)?);
+                }
+            }
+        }
+
+        if let Some(wanted_sas) = &wanted_sc.sa_list {
+            let current_sas = current_sc
+                .and_then(|sc| sc.sa_list.as_deref())
+                .unwrap_or(&[]);
+            messages.extend(rx_sa_messages(
+                ifindex,
+                wanted_sc.sci,
+                wanted_sas,
+                current_sas,
+                xpn,
+            )?);
+        }
+    }
+
+    Ok(messages)
+}
+
+fn rx_sa_messages(
+    ifindex: u32,
+    sci: u64,
+    desired: &[MacsecSaConfig],
+    current: &[MacsecSaConfig],
+    xpn: bool,
+) -> Result<Vec<MacsecMessage>, MacsecError> {
+    let mut messages = Vec::new();
+
+    for current_sa in current {
+        if desired.iter().any(|sa| sa.an == current_sa.an) {
+            continue;
+        }
+        if current_sa.active == Some(true) {
+            let mut deactivate = MacsecRxSa::new(ifindex, sci, current_sa.an);
+            deactivate.active = Some(false);
+            messages.push(deactivate.build(MacsecCmd::UpdRxsa)?);
+        }
+        messages.push(
+            MacsecRxSa::new(ifindex, sci, current_sa.an)
+                .build(MacsecCmd::DelRxsa)?,
+        );
+    }
+
+    for wanted in desired {
+        match current.iter().find(|sa| sa.an == wanted.an) {
+            None => messages.push(
+                rx_sa_from_config(ifindex, sci, wanted, xpn)
+                    .build(MacsecCmd::AddRxsa)?,
+            ),
+            Some(current_sa) => {
+                let mut update = MacsecRxSa::new(ifindex, sci, wanted.an);
+                update.xpn = xpn;
+                let mut changed = false;
+                if wanted.pn.is_some() && wanted.pn != current_sa.pn {
+                    update.pn = wanted.pn;
+                    changed = true;
+                }
+                if wanted.active.is_some() && wanted.active != current_sa.active
+                {
+                    update.active = wanted.active;
+                    changed = true;
+                }
+                if changed {
+                    messages.push(update.build(MacsecCmd::UpdRxsa)?);
+                }
+            }
+        }
+    }
+
+    Ok(messages)
 }
 
 fn tx_sa_from_config(
@@ -795,8 +888,8 @@ impl TryFrom<MacsecMessage> for MacsecConfig {
         let mut ifindex = None;
         let mut secy = MacsecSecyConfig::default();
         let mut secy_seen = false;
-        let mut tx_sa = Vec::new();
-        let mut rx_sc = Vec::new();
+        let mut tx_sa = None;
+        let mut rx_sc = None;
         let mut secy_stats = MacsecSecyStats::default();
         let mut tx_sc_stats = MacsecTxScStats::default();
 
@@ -851,10 +944,10 @@ impl TryFrom<MacsecMessage> for MacsecConfig {
                     }
                 }
                 MacsecAttribute::TxsaList(list) => {
-                    tx_sa = list.iter().map(parse_sa).collect();
+                    tx_sa = Some(list.iter().map(parse_sa).collect());
                 }
                 MacsecAttribute::RxscList(list) => {
-                    rx_sc = list.iter().map(parse_rx_sc).collect();
+                    rx_sc = Some(list.iter().map(parse_rx_sc).collect());
                 }
                 MacsecAttribute::TxscStats(attrs) => {
                     tx_sc_stats = parse_tx_sc_stats(&attrs);
@@ -893,7 +986,6 @@ impl TryFrom<MacsecMessage> for MacsecConfig {
 
         Ok(Self {
             ifindex,
-            delete: false,
             secy,
             tx_sa,
             rx_sc,
@@ -933,7 +1025,7 @@ fn parse_rx_sc(list: &MacsecRxscList) -> MacsecRxScConfig {
                 rx_sc.active = Some(*value != 0)
             }
             MacsecRxscAttribute::SaList(list) => {
-                rx_sc.sa_list = list.iter().map(parse_sa).collect();
+                rx_sc.sa_list = Some(list.iter().map(parse_sa).collect());
             }
             MacsecRxscAttribute::Stats(attrs) => {
                 rx_sc.stats = parse_rx_sc_stats(attrs)
@@ -1248,7 +1340,7 @@ mod tests {
         sa.key = Some(vec![0x81; 16]);
         sa.key_id = vec![0x01];
         sa.active = Some(true);
-        desired.tx_sa.push(sa);
+        desired.tx_sa = Some(vec![sa]);
 
         let messages = desired.to_messages(&current).unwrap();
         assert_eq!(messages.len(), 1);
@@ -1271,21 +1363,103 @@ mod tests {
     }
 
     #[test]
-    fn to_messages_deletes_current_state() {
+    fn to_messages_purges_lists() {
         let mut current = MacsecConfig::new(3);
         let mut sa = MacsecSaConfig::new(0);
         sa.active = Some(true);
-        current.tx_sa.push(sa);
-        current.rx_sc.push(MacsecRxScConfig::new(9));
+        current.tx_sa = Some(vec![sa]);
+        current.rx_sc = Some(vec![MacsecRxScConfig::new(9)]);
 
         let mut desired = MacsecConfig::new(3);
-        desired.delete = true;
+        desired.tx_sa = Some(Vec::new());
+        desired.rx_sc = Some(Vec::new());
 
         let messages = desired.to_messages(&current).unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].cmd, MacsecCmd::UpdTxsa);
         assert_eq!(messages[1].cmd, MacsecCmd::DelTxsa);
         assert_eq!(messages[2].cmd, MacsecCmd::DelRxsc);
+    }
+
+    #[test]
+    fn to_messages_none_leaves_state_untouched() {
+        let mut current = MacsecConfig::new(3);
+        current.tx_sa = Some(vec![MacsecSaConfig::new(0)]);
+        current.rx_sc = Some(vec![MacsecRxScConfig::new(9)]);
+
+        let desired = MacsecConfig::new(3);
+        assert!(desired.to_messages(&current).unwrap().is_empty());
+    }
+
+    #[test]
+    fn to_messages_overrides_tx_sa_list() {
+        let mut current = MacsecConfig::new(3);
+        let mut active = MacsecSaConfig::new(0);
+        active.active = Some(true);
+        current.tx_sa = Some(vec![active, MacsecSaConfig::new(1)]);
+
+        let mut desired = MacsecConfig::new(3);
+        desired.tx_sa = Some(vec![MacsecSaConfig::new(1)]);
+
+        let messages = desired.to_messages(&current).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].cmd, MacsecCmd::UpdTxsa);
+        assert_eq!(messages[1].cmd, MacsecCmd::DelTxsa);
+    }
+
+    #[test]
+    fn to_messages_rx_sa_list_none_keeps_sas() {
+        let mut current = MacsecConfig::new(3);
+        let mut sc = MacsecRxScConfig::new(9);
+        sc.sa_list = Some(vec![MacsecSaConfig::new(0)]);
+        current.rx_sc = Some(vec![sc]);
+
+        let mut desired = MacsecConfig::new(3);
+        desired.rx_sc = Some(vec![MacsecRxScConfig::new(9)]);
+
+        assert!(desired.to_messages(&current).unwrap().is_empty());
+    }
+
+    #[test]
+    fn to_messages_purges_rx_sa_list() {
+        let mut current = MacsecConfig::new(3);
+        let mut sc = MacsecRxScConfig::new(9);
+        let mut sa = MacsecSaConfig::new(0);
+        sa.active = Some(true);
+        sc.sa_list = Some(vec![sa]);
+        current.rx_sc = Some(vec![sc]);
+
+        let mut desired = MacsecConfig::new(3);
+        let mut sc = MacsecRxScConfig::new(9);
+        sc.sa_list = Some(Vec::new());
+        desired.rx_sc = Some(vec![sc]);
+
+        let messages = desired.to_messages(&current).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].cmd, MacsecCmd::UpdRxsa);
+        assert_eq!(messages[1].cmd, MacsecCmd::DelRxsa);
+    }
+
+    #[test]
+    fn to_messages_adds_rx_sa() {
+        let mut current = MacsecConfig::new(3);
+        let mut sc = MacsecRxScConfig::new(9);
+        sc.sa_list = Some(Vec::new());
+        current.rx_sc = Some(vec![sc]);
+
+        let mut desired = MacsecConfig::new(3);
+        let mut sc = MacsecRxScConfig::new(9);
+        let mut sa = MacsecSaConfig::new(0);
+        sa.pn = Some(1);
+        sa.key = Some(vec![0x82; 16]);
+        sa.key_id = vec![0x02];
+        sa.active = Some(true);
+        sc.sa_list = Some(vec![sa]);
+        desired.rx_sc = Some(vec![sc]);
+
+        let messages = desired.to_messages(&current).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].cmd, MacsecCmd::AddRxsa);
     }
 
     #[test]
@@ -1346,20 +1520,22 @@ mod tests {
 
         let config = MacsecConfig::try_from(message).unwrap();
         assert_eq!(config.ifindex, 3);
-        assert!(!config.delete);
         assert_eq!(config.secy.sci, 0x0ed1490827840001);
         assert_eq!(config.secy.cipher_suite, MacSecCipherId::GcmAesXpn128);
         assert_eq!(config.secy.window, Some(100));
         assert_eq!(config.secy.offload, Some(MacSecOffload::Off));
         assert!(config.is_xpn());
-        assert_eq!(config.tx_sa.len(), 1);
-        assert_eq!(config.tx_sa[0].an, 0);
-        assert_eq!(config.tx_sa[0].pn, Some(5));
-        assert_eq!(config.tx_sa[0].ssci, Some(7));
-        assert_eq!(config.rx_sc.len(), 1);
-        assert_eq!(config.rx_sc[0].sci, 0x0ed1490827840009);
-        assert_eq!(config.rx_sc[0].sa_list.len(), 1);
-        assert_eq!(config.rx_sc[0].sa_list[0].pn, Some(8));
+        let tx_sa = config.tx_sa.as_ref().unwrap();
+        assert_eq!(tx_sa.len(), 1);
+        assert_eq!(tx_sa[0].an, 0);
+        assert_eq!(tx_sa[0].pn, Some(5));
+        assert_eq!(tx_sa[0].ssci, Some(7));
+        let rx_sc = config.rx_sc.as_ref().unwrap();
+        assert_eq!(rx_sc.len(), 1);
+        assert_eq!(rx_sc[0].sci, 0x0ed1490827840009);
+        let sa_list = rx_sc[0].sa_list.as_ref().unwrap();
+        assert_eq!(sa_list.len(), 1);
+        assert_eq!(sa_list[0].pn, Some(8));
     }
 
     #[test]
