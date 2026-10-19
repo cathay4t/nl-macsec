@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 use std::error::Error;
 
 use nl_macsec::new_connection;
