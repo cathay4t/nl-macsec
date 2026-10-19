@@ -1,3 +1,13 @@
 # Changelog
+## [0.2.0] - 2026-10-19
+### Breaking changes
+ - API break: redesign the apply action. (17b8915)
+
+### New features
+ - N/A
+
+### Bug fixes
+ - doc: Add CHANGELOG. (f2330b2)
+
 ## [0.1.0] - 2026-10-18
  - Initial release
